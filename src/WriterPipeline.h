@@ -9,15 +9,27 @@
 
 struct WriterPipelineInput {
     tao::json::value eventJson;
-    EventSourceType sourceType;
-    std::string sourceInfo;
 };
 
 
 struct WriterPipeline {
   public:
+    // Params:
+
     uint64_t debounceDelayMilliseconds = 1'000;
     uint64_t writeBatchSize = 1'000;
+    bool verifyMsg = true;
+    bool verifyTime = true;
+    bool verboseReject = true;
+    bool verboseCommit = true;
+    std::function<void(uint64_t)> onCommit;
+
+    // For logging:
+
+    std::atomic<uint64_t> totalProcessed = 0;
+    std::atomic<uint64_t> totalWritten = 0;
+    std::atomic<uint64_t> totalRejected = 0;
+    std::atomic<uint64_t> totalDups = 0;
 
   private:
     hoytech::protected_queue<WriterPipelineInput> validatorInbox;
@@ -53,24 +65,30 @@ struct WriterPipeline {
                         return;
                     }
 
-                    std::string flatStr;
+                    std::string packedStr;
                     std::string jsonStr;
 
                     try {
-                        parseAndVerifyEvent(m.eventJson, secpCtx, true, true, flatStr, jsonStr);
+                        parseAndVerifyEvent(m.eventJson, secpCtx, verifyMsg, verifyTime, packedStr, jsonStr);
                     } catch (std::exception &e) {
-                        LW << "Rejected event: " << m.eventJson << " reason: " << e.what();
+                        if (verboseReject) {
+                            jsonStr = tao::json::to_string(m.eventJson).substr(0,200);
+                            LW << "Rejected event: " << jsonStr << " reason: " << e.what();
+                        }
                         numLive--;
+                        totalRejected++;
                         continue;
                     }
 
-                    writerInbox.push_move({ std::move(flatStr), std::move(jsonStr), hoytech::curr_time_us(), m.sourceType, std::move(m.sourceInfo) });
+                    writerInbox.push_move({ std::move(packedStr), std::move(jsonStr), });
                 }
             }
         });
 
         writerThread = std::thread([&]() {
             setThreadName("Writer");
+
+            NegentropyFilterCache neFilterCache;
 
             while (1) {
                 // Debounce
@@ -107,16 +125,17 @@ struct WriterPipeline {
                         auto event = std::move(newEvents.front());
                         newEvents.pop_front();
 
-                        if (event.flatStr.size() == 0) {
+                        if (event.packedStr.size() == 0) {
                             shutdownComplete = true;
                             break;
                         }
 
                         numLive--;
 
-                        auto *flat = flatStrToFlatEvent(event.flatStr);
-                        if (lookupEventById(txn, sv(flat->id()))) {
+                        PackedEventView packed(event.packedStr);
+                        if (lookupEventById(txn, packed.id())) {
                             dups++;
+                            totalDups++;
                             continue;
                         }
 
@@ -127,18 +146,24 @@ struct WriterPipeline {
                 if (newEventsToProc.size()) {
                     {
                         auto txn = env.txn_rw();
-                        writeEvents(txn, newEventsToProc);
+                        writeEvents(txn, neFilterCache, newEventsToProc);
                         txn.commit();
                     }
 
                     for (auto &ev : newEventsToProc) {
-                        if (ev.status == EventWriteStatus::Written) written++;
-                        else dups++;
-                        // FIXME: log rejected stats too
+                        if (ev.status == EventWriteStatus::Written) {
+                            written++;
+                            totalWritten++;
+                        } else {
+                            dups++;
+                            totalDups++;
+                        }
                     }
+
+                    if (onCommit) onCommit(written);
                 }
 
-                if (written || dups) LI << "Writer: added: " << written << " dups: " << dups;
+                if (verboseCommit && (written || dups)) LI << "Writer: added: " << written << " dups: " << dups;
 
                 if (shutdownComplete) {
                     flushInbox.push_move(true);
@@ -158,12 +183,20 @@ struct WriterPipeline {
     }
 
     void write(WriterPipelineInput &&inp) {
+        if (inp.eventJson.is_null()) return;
+        totalProcessed++;
         numLive++;
         validatorInbox.push_move(std::move(inp));
     }
 
+    void write(EventToWrite &&inp) {
+        totalProcessed++;
+        numLive++;
+        writerInbox.push_move(std::move(inp));
+    }
+
     void flush() {
-        validatorInbox.push_move({ tao::json::null, EventSourceType::None, "" });
+        validatorInbox.push_move({ tao::json::null, });
         flushInbox.wait();
     }
 
